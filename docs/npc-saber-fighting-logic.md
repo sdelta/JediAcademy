@@ -66,7 +66,7 @@ NPC_BehaviorSet_Jedi()          code/game/NPC.cpp:1583
 
 1. **Pain** — if `painDebounceTime` is active, just face the enemy and wait.
 2. **Saber lock** — if `saberLockTime > level.time`, mash the attack button to
-   win the lock (see §7).
+   win the lock (see §9).
 3. **Dropped saber** — if `saberInFlight`, go pick it up / pull it back
    (`Jedi_CanPullBackSaber`, `code/game/AI_Jedi.cpp:6439`).
 4. **Dead enemy** — gloat, erode aggression, turn the saber off.
@@ -87,7 +87,7 @@ from the `.npc` file in `NPC_stats.cpp`):
 | `aim` | 1 | Aiming accuracy (mostly irrelevant for pure saber) |
 | `move` | 1 | Movement willingness |
 | `intelligence` | 1 | How well it uses terrain/obstacles |
-| `rank` | (class default) | Saber skill tier — affects parry timing and lock strength |
+| `rank` | (class default) | Saber skill tier — affects parry timing, kata access, and lock strength |
 | `FP_SABER_DEFENSE` | 3 | Auto-block / parry / knockaway power |
 | `FP_SABER_OFFENSE` | 1 | Ability to break through enemy parries |
 
@@ -132,12 +132,11 @@ Aggression is the key knob that makes saber duels feel alive. It starts at the
 Adjustment points (all in `code/game/AI_Jedi.cpp`):
 
 - `Jedi_CombatTimersUpdate()` (`:4967`) reacts to saber *events*:
-  - **Parried** (`SEF_PARRIED`) → sometimes −1 aggression, switch to a faster
-    attack.
-  - **Hit the enemy** (`SEF_HITENEMY`) → sometimes −1, switch to a stronger
-    attack.
+  - **Parried** (`SEF_PARRIED`) → sometimes −1 aggression, and (for NPCs that
+    are allowed to switch styles) shift to a faster attack.
+  - **Hit the enemy** (`SEF_HITENEMY`) → sometimes −1.
   - **Blocked** (`SEF_BLOCKED`) → −1 (or −2 if "knock-blocked", −5 if it also
-    lost its saber), switch to a *stronger* attack.
+    lost its saber).
 - Enemy state: enemy's saber is **off** → +2 ("charge!"); enemy has a saber → +1;
   enemy is using a blaster and not shooting → +1.
 - `Jedi_AdjustAggression()` (`:717`) periodically re-averages aggression from
@@ -149,10 +148,18 @@ High aggression → closes distance, attacks more, taunts more
 (`Jedi_CombatIdle`, `:5176`). Low aggression → keeps its distance, backs off,
 more likely to turn its saber off and taunt.
 
-There's also a **saber-style self-tuning loop**: on a block the cultist shifts
-*toward strong* (`Jedi_AdjustSaberAnimLevel(+1)`); on a parry or a hit it shifts
-*toward fast* (`-1`). This is why weak fast-style fighters occasionally wind up
-in medium or strong if the player keeps blocking them.
+**Important caveat — the cultist is style-locked.** The generic Reborn *does*
+have a style self-tuning loop (`Jedi_AdjustSaberAnimLevel(+1)` toward strong on a
+block, `-1` toward fast on a parry/hit). But `Jedi_AdjustSaberAnimLevel`
+(`AI_Jedi.cpp:1147`) has a hard-coded override for the cultist variants:
+
+- `cultist_saber` / `cultist_saber_throw` → forced to `SS_FAST`
+- `cultist_saber_med` / `_med_throw` → forced to `SS_MEDIUM`
+- `cultist_saber_strong` / `_strong_throw` → forced to `SS_STRONG`
+- `cultist_saber_all` / `_all_throw` → may switch freely
+
+So a base `cultist_saber` keeps adjusting its *aggression*, but it will **never
+change styles** — it stays in fast. Only the `_all` variant self-tunes.
 
 ---
 
@@ -166,7 +173,9 @@ in medium or strong if the player keeps blocking them.
 | 1 | `SS_FAST` | Quick, weak swings; high attack cadence; easiest to chain; best defense |
 | 2 | `SS_MEDIUM` | Balanced speed/damage |
 | 3 | `SS_STRONG` | Slow, heavy; breaks parries; can knock down |
-| 6/7 | `SS_DUAL`/`SS_STAFF` | (not used by the cultist) |
+| 4/5 | `SS_DESANN`/`SS_TAVION` | Boss-only styles |
+| 6 | `SS_DUAL` | Two sabers |
+| 7 | `SS_STAFF` | Double-bladed saber (see §8) |
 
 The base cultist uses **fast** (`saberStyle 1`). That means: it attacks a lot
 but each hit does little damage, and it relies on `FP_SABER_DEFENSE 3` to stay
@@ -174,7 +183,113 @@ alive rather than raw power.
 
 ---
 
-## 7. Saber-on-saber mechanics (block / parry / knockaway / lock)
+## 7. The move list — what a saber cultist can actually do
+
+The complete catalog of saber moves is the `saberMoveName_t` enum
+(`code/game/wp_saber.h:245`) with its per-move data in the `saberMoveData[]`
+table (`code/game/bg_panimate.cpp:122`). Each entry stores the animation, the
+blade's start/end quadrant, a `blocking` value, and the `chain_idle` /
+`chain_attack` moves that follow it. Filtering that down to a fast-style
+`cultist_saber`:
+
+**Core attacks — the seven directional cuts** (fast `A1` animation set):
+
+| Move | Animation | Cut |
+|------|-----------|-----|
+| `LS_A_TL2BR` | `BOTH_A1_TL_BR` | top-left → bottom-right |
+| `LS_A_L2R` | `BOTH_A1__L__R` | left → right |
+| `LS_A_BL2TR` | `BOTH_A1_BL_TR` | bottom-left → top-right |
+| `LS_A_BR2TL` | `BOTH_A1_BR_TL` | bottom-right → top-left |
+| `LS_A_R2L` | `BOTH_A1__R__L` | right → left |
+| `LS_A_TR2BL` | `BOTH_A1_TR_BL` | top-right → bottom-left |
+| `LS_A_T2B` | `BOTH_A1_T__B_` | overhead down |
+
+**Combos** — the `LS_T1_*` transition moves (`bg_panimate.cpp:326`, a full
+6×6 quadrant matrix) link one cut into the next. Because fast style has the
+whole transition matrix, it strings 3–5 cuts together fluidly — that is the
+"weak but rapid" identity.
+
+**Kicks** — `Jedi_DecideKick` (`AI_Jedi.cpp:1250`) triggers the `A7` kick set
+(front / back / left / right / spin / split). It is gated by both rank and
+aggression, so it is rare for the low-rank cultist.
+
+**Reactive / defensive moves** (what you see when blades clash; see §9):
+- Parry — `BOTH_P1_S1_*` (`LS_PARRY_*`)
+- Broken parry — `BOTH_H1_S1_*` (`LS_H1_*`)
+- Knockaway — `BOTH_K1_S1_*` (`LS_K1_*`)
+- Bounce / deflect — `BOTH_B1_*`, `BOTH_D1_*`
+
+**Evasion acrobatics** — rolls, cartwheels, dodges via
+`Jedi_EvasionSaber`/`Jedi_DodgeEvasion` (limited — `evasion`/`move` are only 1).
+
+**What it cannot do:**
+
+- **Kata / special attacks** (`BOTH_A1_SPECIAL`, spin attacks, butterflies) —
+  gated behind `rank >= RANK_LT_COMM` in `Jedi_CheckKataAttack`
+  (`AI_Jedi.cpp:6532`); cultists are low-rank.
+- **Strong / medium moves** — it only knows `SS_FAST`.
+- **Saber throw** — only the `_throw` variants have `FP_SABERTHROW`.
+- **Dual / staff / Alora-specific moves**.
+
+So in practice a base cultist is a pure fast-style boxer: seven directional cuts
+chained into flurries, an occasional kick, and a lot of parry/bounce defense —
+no katas, no throws, no heavy spins.
+
+---
+
+## 8. The staff-wielding variant (`reborn_staff`)
+
+There is no `cultist_staff.npc` — the staff-wielding member of this enemy family
+is the **`reborn_staff`** (`ext_data/npcs/reborn_staff.npc`), still `CLASS_REBORN`
+and therefore running the exact same `AI_Jedi` pipeline. (Nothing stops you from
+giving a cultist a staff via `saberStyle 7`; the `.npc` parser accepts any value
+up to `SS_STAFF` — `NPC_stats.cpp:3963`.)
+
+`reborn_staff` is a much heavier fighter than the cultist:
+
+```
+saber           dual_1              // SABER_STAFF, numBlades 2, twoHanded 1
+saberStyle      7                   // SS_STAFF
+rank            ltcomm              // RANK_LT_COMM — the kata threshold
+aggression      5    evasion 5    move 5    reactions 5    intelligence 5
+FP_SABER_DEFENSE 3  FP_SABER_OFFENSE 3
+FP_SABERTHROW   2    FP_PUSH 3  FP_PULL 2  FP_GRIP 2  FP_LIGHTNING 1 ...
+health          300
+```
+
+Its saber (`ext_data/sabers/dual_1.sab`) is `SABER_STAFF` with `numBlades 2` and
+`twoHanded 1`. Two-handed gives the +1 power bonus in locks/parries (see §9)
+and restricts force powers; it also has `singleBladeThrowable 1`, so it can
+deactivate one blade and throw the remaining single blade (matching its
+`FP_SABERTHROW 2`).
+
+**Distinctive staff moves** (all in `saberMoveData[]`, `bg_panimate.cpp`):
+
+| Move | Animation | What it is |
+|------|-----------|------------|
+| `LS_JUMPATTACK_STAFF_LEFT/RIGHT` | `BOTH_BUTTERFLY_FL1`/`FR1` | butterfly aerial staff spin |
+| `LS_STAFF_SOULCAL` | `BOTH_A7_SOULCAL` | the Soul Calibur-style multi-hit staff whirl |
+| `LS_SPINATTACK` | `BOTH_SPINATTACK7` | the staff spin attack |
+| `LS_HILT_BASH` | `BOTH_A7_HILT` | staff hilt bash |
+| `LS_STABDOWN_STAFF` | `BOTH_STABDOWN_STAFF` | downward staff stab |
+| `LS_KICK_*` | `BOTH_A7_KICK_*` | the full kick set (front/back/sides/spin/split + air) |
+
+The staff style also has its own idle stance (`BOTH_SABERSTAFF_STANCE`,
+`bg_pmove.cpp:8263`) and still performs the seven directional cuts, but with the
+double-bladed staff animations — every swing hits with both ends.
+
+**The key difference from the cultist:** `reborn_staff` has `rank ltcomm`
+(`RANK_LT_COMM`), which clears the `Jedi_CheckKataAttack` rank gate
+(`AI_Jedi.cpp:6532`). So it *can* throw out katas — butterflies, the Soul Cal
+whirl, and the staff spin — on top of everything else. (Its lower-tier sibling
+`reborn_staff2` has `rank lt`, so it stays kata-free.) Combined with
+`aggression 5`, `FP_SABER_DEFENSE/OFFENSE 3`, and the two-handed staff, it is a
+fast, aggressive, kata-spamming duellist rather than the cultist's defensive
+boxer.
+
+---
+
+## 9. Saber-on-saber mechanics (block / parry / knockaway / lock)
 
 The physical resolution happens in `code/game/wp_saber.cpp`, in the saber-vs-
 saber collision block (~`:5255`–`:5460`). When two blades cross, the game
@@ -216,7 +331,7 @@ fairly ordinary parry cadence — it won't spam parries like a boss.
 
 ---
 
-## 8. Force powers in saber combat
+## 10. Force powers in saber combat
 
 The cultist has three force powers, none of which it "casts" visibly — they are
 passive combat modifiers:
@@ -232,21 +347,22 @@ passive combat modifiers:
 
 ---
 
-## 9. A fight from the cultist's perspective
+## 11. A fight from the cultist's perspective
 
 Putting it together, here is what the base `cultist_saber` does in a duel:
 
 1. Acquires the player as enemy and sets `combatMove`, facing them.
 2. Because the enemy has a saber, aggression ticks up (+1); it closes to
    striking distance and strafes (`Jedi_EvasionSaber`).
-3. In striking range it fires `WeaponThink()`, chaining fast-style swings. Fast
-   style means a steady stream of weak cuts.
+3. In striking range it fires `WeaponThink()`, chaining fast-style cuts. Fast
+   style means a steady stream of weak slashes.
 4. When the player attacks back, `FP_SABER_DEFENSE 3` means the cultist
    auto-blocks/parries frequently, and because its defense is maxed it may
    knock the player's attack away (broken parry).
-5. If its own attack is blocked, `SEF_BLOCKED` drops aggression and it shifts
-   toward a stronger style; if it lands a hit, `SEF_HITENEMY` drops aggression
-   and it shifts back toward fast.
+5. If its own attack is blocked, `SEF_BLOCKED` drops aggression, so it gets a
+   little more cautious — but it stays in fast style (it is style-locked, see
+   §5). If it lands a hit, `SEF_HITENEMY` drops aggression too, and it keeps
+   chaining.
 6. It keeps this block-parry-counter rhythm, aggression oscillating, until it
    wins or is beaten down.
 
@@ -257,13 +373,15 @@ attack that its fast style and low offense cannot answer.
 
 ---
 
-## 10. Reference table
+## 12. Reference table
 
 | Concept | File / line |
 |---------|-------------|
 | NPC spawn class + variants | `code/game/NPC_spawn.cpp:3286` (`SP_NPC_Cultist_Saber`) |
 | NPC definition | `ext_data/npcs/cultist_saber.npc` |
+| Staff-wielder definition | `ext_data/npcs/reborn_staff.npc` |
 | Saber definition ("Reborn") | `ext_data/sabers/sabers.sab` |
+| Staff saber ("dual_1") | `ext_data/sabers/dual_1.sab` |
 | Behavior wiring | `code/game/NPC.cpp:1583` (`NPC_BehaviorSet_Jedi`) |
 | Main think loop | `code/game/AI_Jedi.cpp:7602` (`NPC_BSJedi_Default`) |
 | Attack entry / housekeeping | `code/game/AI_Jedi.cpp:6585` (`Jedi_Attack`) |
@@ -272,8 +390,15 @@ attack that its fast style and low offense cannot answer.
 | Aggression/event reactions | `code/game/AI_Jedi.cpp:4967` (`Jedi_CombatTimersUpdate`) |
 | Engagement distance | `code/game/AI_Jedi.cpp:1351` (`Jedi_CombatDistance`) |
 | Aggression helpers | `code/game/AI_Jedi.cpp:640` / `:675` / `:717` |
+| Style-lock override | `code/game/AI_Jedi.cpp:1147` (`Jedi_AdjustSaberAnimLevel`) |
+| Kick decision | `code/game/AI_Jedi.cpp:1250` (`Jedi_DecideKick`) |
+| Kata decision | `code/game/AI_Jedi.cpp:6530` (`Jedi_CheckKataAttack`) |
 | Parry timing | `code/game/AI_Jedi.cpp:2645` (`Jedi_ReCalcParryTime`) |
+| Saber move enum | `code/game/wp_saber.h:245` (`saberMoveName_t`) |
+| Saber move data table | `code/game/bg_panimate.cpp:122` (`saberMoveData[]`) |
+| Transition (chain) matrix | `code/game/bg_panimate.cpp:326` |
 | Saber block/parry/knockaway | `code/game/wp_saber.cpp:5255`–`:5460` |
 | Parry function | `code/game/wp_saber.cpp:4029` (`WP_SaberParry`) |
 | Saber lock check | `code/game/wp_saber.cpp:3571` (`WP_SabersCheckLock`) |
 | Saber style enum | `code/qcommon/q_shared.h:925` |
+| Rank enum | `code/game/ai.h:54` |
